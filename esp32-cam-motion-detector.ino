@@ -19,39 +19,39 @@ const char* ssid = "YOUR_SSID";
 const char* password = "YOUR_PASSWORD";
 
 // MQTT Broker Setup *REQUIRED*
-const char* mqtt_server = "YOUR_MQTT";              // MQTT Broker IP/URL
+const char* mqtt_server = "YOUR_MQTT_BROKER";           // MQTT Broker IP/URL
 const int mqtt_port = 1883;                         // MQTT Broker Port
 
+// Home Assistant Setup - https://www.home-assistant.io/docs/mqtt/discovery/
+const char* haConfigTopic = "homeassistant/binary_sensor/office_motion_sensor/config";
+const char* haStateTopic = "homeassistant/binary_sensor/office_motion_sensor/state";
+const char* sensorName = "Office Motion Sensor";
+const char* uniqueID = "office_motion_sensor";
 
 // MQTT Pub Topics **REQUIRED**
 const char* onlinetopic = "motion/office/online";                 // Tells us it's online. (heartbeat)
-unsigned long heartbeatInterval = 60000;                    // Heartbeat interval in ms (60000 = 60 seconds)
 const char* motiontopic = "motion/office/status";                 // Tells us if there's motion or not
 const char* lockoutTimePub = "motion/office/newlockout";          // Tells us new Motion Lockout time when set
 const char* heartbeatIntervalPub = "motion/office/newHeartbeat";  // Tells us new Heartbeat Interval when set
 
-//MQTT Topics to change settings
+//MQTT Topics to trigger action
+const char* MQTTledEnable = "motion/office/settings/ledEnable";   // enable/disable LED
 const char* MQTTheartbeat = "motion/office/settings/heartbeat";   // set heartbeat interval
+const char* MQTTmotionenable = "motion/office/settings/enable";   // "enable" or "disable" motion detection
+const char* MQTTmotionlockout = "motion/office/settings/lockout"; // time in ms to keep motion triggered
+const char* MQTTstatus = "motion/office/settings/status";                  // JSON status message
+
+// Support Variables
 const int MQTTheartbeatMIN = 59999;                               // 1 minute
 const int MQTTheartbeatMAX = 300001;                              // 5 minutes
-const char* MQTTmotionenable = "motion/office/settings/enable";   // "enable" or "disable"
-const char* MQTTmotionlockout = "motion/office/settings/lockout"; // time in ms to keep motion triggered
 const int MQTTmotionlockoutMIN = 999;
 const int MQTTmotionlockoutMAX = 60001;
+
 // MQTT Sub Topics
 const char* subtopic = "motion/office/settings/+";
 
 // LED Pin
 #define LEDPIN 12
-
-
-
-// NO NEED TO EDIT BELOW THIS LINE UNLESS YOU WANT TO CHANGE THINGS
-
-
-#include "eloquent.h"
-#include "eloquent/vision/motion/naive.h"
-
 
 // uncomment based on your camera and resolution
 
@@ -76,7 +76,19 @@ const char* subtopic = "motion/office/settings/+";
 
 
 
+/* NO NEED TO EDIT BELOW THIS LINE UNLESS YOU WANT TO CHANGE THINGS */
+
+
+#include "eloquent.h"
+#include "eloquent/vision/motion/naive.h"
+#include <ArduinoJson.h>
+
+
+
+
+
 // Setup Detection Variables
+bool ledEnable = true;
 bool motionEnabled = true;
 bool detection = false;
 bool motionEvent = false;
@@ -84,6 +96,7 @@ unsigned long motionLockoutTime = 5000;
 unsigned long detectionStartTime = millis();
 unsigned long lastHeartbeat = millis();
 bool initialHeartbeat = false;
+unsigned long heartbeatInterval = 60000;                          // Heartbeat interval in ms (60000 = 60 seconds)
 
 
 WiFiClient espClient;
@@ -151,6 +164,58 @@ void setup_wifi() {
   Serial.println("IP address: ");
   Serial.println(WiFi.localIP());
 }
+const char* True = "true";
+const char* False = "false";
+
+void publishHAConfig(){
+/*   
+*    Publish sensor status to MQTT
+*/
+  // Build JSON
+  // Allocate memory for the document
+  StaticJsonDocument<256> doc;
+  
+  // Add some values
+  doc["device_class"] = "motion";
+  doc["name"] = sensorName;
+  doc["unique_id"] = uniqueID;
+  doc["state_topic"] = haStateTopic;
+  doc["value_template"] = "{{value_json.status}}";
+  
+  // Create Buffer
+  char buffer[300];
+  
+  size_t n = serializeJsonPretty(doc, buffer);
+  Serial.println(buffer);
+  client.publish(haConfigTopic,buffer, true);
+}
+
+void publishState(){
+/*   
+ *    Publish sensor status to MQTT
+ */
+ 
+  // Build JSON
+  // Allocate memory for the document
+  StaticJsonDocument<256> doc;
+  
+  // Add some values
+  
+  doc["status"] = detection?"ON":"OFF";
+  doc["heartbeat"] = lastHeartbeat;
+  doc["heartbeatInterval"] = heartbeatInterval;
+  doc["motionLockoutTime"] = motionLockoutTime;
+  doc["motionEnabled"]= motionEnabled?"Enabled":"Disabled";
+  doc["ledEnable"] = ledEnable?"Enabled":"Disabled";
+  
+  // Create Buffer
+  char buffer[300];
+  
+  size_t n = serializeJsonPretty(doc, buffer);
+  Serial.println(buffer);
+  client.publish(haStateTopic,buffer);
+}
+
 
 void callback(char* topic, byte* message, unsigned int length) {
   Serial.print("Message arrived on topic: ");
@@ -165,6 +230,22 @@ void callback(char* topic, byte* message, unsigned int length) {
   Serial.println();
 
   // MQTT Actions
+
+  // LED Enable/Disable
+  if (String(topic) == MQTTledEnable){
+    if (messageTemp == "true"){
+      if (ledEnable == false){
+        Serial.println("LED disabled");
+        ledEnable = true;
+      }
+    if (messageTemp == "false"){
+      if (ledEnable == true){
+        ledEnable = false;
+      }
+    }
+    }
+  }
+
   
   // Heartbeat Interval
   if (String(topic) == MQTTheartbeat){
@@ -224,7 +305,13 @@ void callback(char* topic, byte* message, unsigned int length) {
       }
     }
   }
-
+  // Status Message with JSON payload
+  if (String(topic) == MQTTstatus){
+    if (messageTemp == "get"){
+      publishState();
+    }
+  }
+  
   
 }
 
@@ -269,6 +356,9 @@ void detect_motion(){
       detect_motion();
     }
 }
+
+
+
 void loop() {
   if (!client.connected()) {
     reconnect();
@@ -279,19 +369,25 @@ void loop() {
   unsigned long currentTime = millis();         // Used for HEARTBEAT and MOTION DETECTION
 
   // BEGIN HEARTBEAT
-  if (initialHeartbeat){
+  if (!initialHeartbeat){
+    // This allows us to do initial setup of the sensor upon the first heartbeat...
+    // Publish Home Assistant MQTT Config
+    publishHAConfig();
+  }
+  else{
+    // Send First Heartbeat
     unsigned long timeoutHeartbeat = lastHeartbeat + heartbeatInterval;
     if (currentTime > timeoutHeartbeat){
       Serial.print("Heartbeat: ");
       Serial.println(currentTime);
-      client.publish(onlinetopic,"online");
+      publishState();
       lastHeartbeat = millis();
     }
   }
   if (!initialHeartbeat){
     Serial.print("Heartbeat: ");
     Serial.println(currentTime);
-    client.publish(onlinetopic,"online");
+    publishState();
     lastHeartbeat = millis();
     initialHeartbeat = true;
   }
@@ -305,8 +401,9 @@ void loop() {
       if (currentTime > timeout){
         detect_motion();
         if (!detection){
-          Serial.println("Motion Detection Event End");
-          client.publish(motiontopic, "off");   // Publish motiontopic "off"
+          Serial.print("Publishing to ");
+          Serial.println(haStateTopic);
+          publishState();
           digitalWrite(LEDPIN, LOW);            // Turn off LED
           motionEvent = false;
         }
@@ -315,8 +412,9 @@ void loop() {
     else{
       detect_motion();
       if (detection){
-        Serial.println("Motion Detection Event Begin");
-        client.publish(motiontopic, "on");   // Publish motiontopic "on"
+        Serial.print("Publishing to ");
+        Serial.println(haStateTopic);
+        publishState();
         digitalWrite(LEDPIN, HIGH);               // Turn on LED
         detectionStartTime = millis();
         motionEvent = true;
