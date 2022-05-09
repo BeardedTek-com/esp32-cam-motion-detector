@@ -15,11 +15,11 @@
 #include <PubSubClient.h>
 
 // WiFi Setup *REQUIRED*
-const char* ssid = "I'm Not Gonna Tell You";
-const char* password = "MegLogWillEmb7040";
+const char* ssid = "YOUR_SSID";
+const char* password = "YOUR_PASSWORD";
 
 // MQTT Broker Setup *REQUIRED*
-const char* mqtt_server = "192.168.2.87";           // MQTT Broker IP/URL
+const char* mqtt_server = "YOUR_MQTT";              // MQTT Broker IP/URL
 const int mqtt_port = 1883;                         // MQTT Broker Port
 
 
