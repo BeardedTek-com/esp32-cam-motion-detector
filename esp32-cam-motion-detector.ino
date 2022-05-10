@@ -1,3 +1,9 @@
+#include <LoopbackStream.h>
+#include <PipedStream.h>
+
+#include <StreamUtils.h>
+#include <ArduinoJson.h>
+
 /**
  * ESP32 Camera as Motion Detector
  * Based on https://eloquentarduino.com/projects/esp32-arduino-motion-detection
@@ -19,20 +25,25 @@ const char* ssid = "YOUR_SSID";
 const char* password = "YOUR_PASSWORD";
 
 // MQTT Broker Setup *REQUIRED*
-const char* mqtt_server = "YOUR_MQTT_BROKER";           // MQTT Broker IP/URL
+const char* mqtt_server = "YOUR_MQTT_BROKER";       // MQTT Broker IP/URL
 const int mqtt_port = 1883;                         // MQTT Broker Port
+const char* uniqueID = "OfficeMultiSensor";         // Unique Client Name
 
-// Home Assistant Setup - https://www.home-assistant.io/docs/mqtt/discovery/
-const char* haConfigTopic = "homeassistant/binary_sensor/office_motion_sensor/config";
-const char* haStateTopic = "homeassistant/binary_sensor/office_motion_sensor/state";
-const char* sensorName = "Office Motion Sensor";
-const char* uniqueID = "office_motion_sensor";
-
-// MQTT Pub Topics **REQUIRED**
-const char* onlinetopic = "motion/office/online";                 // Tells us it's online. (heartbeat)
-const char* motiontopic = "motion/office/status";                 // Tells us if there's motion or not
-const char* lockoutTimePub = "motion/office/newlockout";          // Tells us new Motion Lockout time when set
-const char* heartbeatIntervalPub = "motion/office/newHeartbeat";  // Tells us new Heartbeat Interval when set
+// Home Assistant Setup
+// State/Attrib Topics
+const char* haStateTopic = "homeassistant/sensor/office_multi_sensor/state";
+const char* haAttribTopic = "homeassistant/sensor/office_multi_sensor/state";
+//Motion Sensor
+const char* haMotionConfigTopic = "homeassistant/binary_sensor/office_motion_sensor/config";
+const char* haMotionName = "Office Motion Sensor";
+// Temp Sensor
+const char* haTempStateTopic = "homeassistant/sensor/office_multi_sensor/state";
+const char* haTempConfigTopic = "homeassistant/sensor/office_temp_sensor/config";
+const char* haTempName = "Office Temperature Sensor";
+// RH Sensor
+const char* haRHStateTopic = "homeassistant/sensor/office_multi_sensor/state";
+const char* haRHConfigTopic = "homeassistant/sensor/office_humidity_sensor/config";
+const char* haRHName = "Office Humidity Sensor";
 
 //MQTT Topics to trigger action
 const char* MQTTledEnable = "motion/office/settings/ledEnable";   // enable/disable LED
@@ -50,8 +61,25 @@ const int MQTTmotionlockoutMAX = 60001;
 // MQTT Sub Topics
 const char* subtopic = "motion/office/settings/+";
 
-// LED Pin
+// LED Setup
 #define LEDPIN 12
+
+//DHT Setup
+#define DHT_PIN 13
+#define DHT_TYPE DHT11
+bool tempEnabled = true;
+bool humidityEnabled = true;
+bool reportTempF = true;
+unsigned long dhtWait = 60000; // in miliseconds
+
+
+// NO NEED TO EDIT BELOW THIS LINE UNLESS YOU WANT TO CHANGE THINGS
+
+
+#include "eloquent.h"
+#include "eloquent/vision/motion/naive.h"
+#include "DHT.h"
+
 
 // uncomment based on your camera and resolution
 
@@ -76,17 +104,6 @@ const char* subtopic = "motion/office/settings/+";
 
 
 
-/* NO NEED TO EDIT BELOW THIS LINE UNLESS YOU WANT TO CHANGE THINGS */
-
-
-#include "eloquent.h"
-#include "eloquent/vision/motion/naive.h"
-#include <ArduinoJson.h>
-
-
-
-
-
 // Setup Detection Variables
 bool ledEnable = true;
 bool motionEnabled = true;
@@ -98,6 +115,17 @@ unsigned long lastHeartbeat = millis();
 bool initialHeartbeat = false;
 unsigned long heartbeatInterval = 60000;                          // Heartbeat interval in ms (60000 = 60 seconds)
 
+// Setup DHT
+DHT dht(DHT_PIN, DHT_TYPE);
+unsigned long dhtLastRead = millis();
+float dhtF = 0;
+float dhtT = 0;
+float dhtH = 0;
+float dhtHIF = 0;
+float dhtHIC = 0;
+
+// Setup Debugging
+bool debug = false;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -111,9 +139,8 @@ int value = 0;
 
 Eloquent::Vision::Motion::Naive<THUMB_WIDTH, THUMB_HEIGHT> detector;
 
-
 void setup() {
-  
+    dht.begin();
     pinMode(LEDPIN, OUTPUT);
     digitalWrite(LEDPIN, LOW);
     delay(4000);
@@ -124,8 +151,9 @@ void setup() {
 
     if (!camera.begin())
         eloquent::abort(Serial, "Camera init error");
-
-    Serial.println("Camera init OK");
+    if (debug){
+      Serial.println("Camera init OK");
+    }
 
     // wait for at least 10 frames to be processed before starting to detect
     // motion (false triggers at start)
@@ -167,67 +195,133 @@ void setup_wifi() {
 const char* True = "true";
 const char* False = "false";
 
-void publishHAConfig(){
+void publishHATempConfig(){
 /*   
 *    Publish sensor status to MQTT
 */
-  // Build JSON
-  // Allocate memory for the document
-  StaticJsonDocument<256> doc;
-  
-  // Add some values
-  doc["device_class"] = "motion";
-  doc["name"] = sensorName;
-  doc["unique_id"] = uniqueID;
-  doc["state_topic"] = haStateTopic;
-  doc["value_template"] = "{{value_json.status}}";
-  
   // Create Buffer
-  char buffer[300];
-  
-  size_t n = serializeJsonPretty(doc, buffer);
-  Serial.println(buffer);
-  client.publish(haConfigTopic,buffer, true);
+  char buffer[256]; // Used for all publish commands
+
+  // Temp Sensor
+  // Build JSON
+  StaticJsonDocument<1000> haTemp;
+
+  // Add Values
+  haTemp["device_class"] = "temperature";
+  haTemp["name"] = haTempName;
+  haTemp["state_topic"] = haStateTopic;
+  haTemp["value_template"] = "{{value_json.temperature}}";
+  haTemp["json_attributes_topic"] = haAttribTopic;
+
+  // Publish haTemp Config
+  serializeJsonPretty(haTemp, buffer);
+  client.publish(haTempConfigTopic,buffer,true);
 }
+void publishHARHConfig(){
+/*   
+*    Publish sensor status to MQTT
+*/
+  // Create Buffer
+  char buffer[1000]; // Used for all publish commands
+
+  // Humidity Sensor
+  // Build JSON
+  StaticJsonDocument<1000> haRH;
+
+  // Add Values
+  haRH["device_class"] = "humidity";
+  haRH["name"] = haRHName;
+  haRH["state_topic"] = haStateTopic;
+  haRH["value_template"] = "{{value_json.humidity}}";
+  haRH["json_attributes_topic"] = haAttribTopic;
+
+  // Publish haRH Config
+  serializeJsonPretty(haRH, buffer);
+  client.publish(haRHConfigTopic,buffer,true);
+}
+
+void publishHAMotionConfig(){
+/*   
+*    Publish sensor status to MQTT
+*/
+  // Create Buffer
+  char buffer[1000]; // Used for all publish commands
+
+
+  // Motion Sensor
+  // Build JSON
+  StaticJsonDocument<1000> haMotion;
+  
+  // Add Values
+  haMotion["device_class"] = "motion";
+  haMotion["name"] = haMotionName;
+  haMotion["state_topic"] = haStateTopic;
+  haMotion["value_template"] = "{{value_json.motion}}";
+  haMotion["json_attributes_topic"] = haAttribTopic;
+  
+  //Publish haMotion Config
+  serializeJsonPretty(haMotion, buffer);
+  client.publish(haMotionConfigTopic,buffer,true);
+}
+
 
 void publishState(){
 /*   
  *    Publish sensor status to MQTT
  */
- 
+  Serial.println("Executing publishState()");
   // Build JSON
   // Allocate memory for the document
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<1000> haState;
   
   // Add some values
   
-  doc["status"] = detection?"ON":"OFF";
-  doc["heartbeat"] = lastHeartbeat;
-  doc["heartbeatInterval"] = heartbeatInterval;
-  doc["motionLockoutTime"] = motionLockoutTime;
-  doc["motionEnabled"]= motionEnabled?"Enabled":"Disabled";
-  doc["ledEnable"] = ledEnable?"Enabled":"Disabled";
+  haState["heartbeat"] = lastHeartbeat;
+  haState["heartbeatInterval"] = heartbeatInterval;
+  haState["motionLockoutTime"] = motionLockoutTime;
+  haState["ledEnable"] = ledEnable?"Enabled":"Disabled";
+  haState["motionEnabled"]= motionEnabled?"Enabled":"Disabled";
+  
+  if (reportTempF){
+    haState["temperature"] = dhtF;
+    haState["HeatIndex"] = dhtHIF;
+    haState["units"] = "°F";
+  }
+  else{
+    haState["temperatureCelsius"] = dhtT;
+    haState["HeatIndexCelsius"] = dhtHIC;
+    haState["units"] = "°C";
+  }
+  haState["humidity"] = dhtH;
+  haState["motion"] = detection?"ON":"OFF";
   
   // Create Buffer
-  char buffer[300];
-  
-  size_t n = serializeJsonPretty(doc, buffer);
+  Serial.println("creating buffer");
+  char buffer[1000];
+  Serial.println("buffer created");
+  serializeJsonPretty(haState, buffer);
+  Serial.print("Publish State: ");
+  Serial.println(client.publish(haStateTopic,buffer)?"OK":"Error");
   Serial.println(buffer);
-  client.publish(haStateTopic,buffer);
 }
 
-
 void callback(char* topic, byte* message, unsigned int length) {
-  Serial.print("Message arrived on topic: ");
-  Serial.print(topic);
-  Serial.print(". Message: ");
+  if (debug){
+    Serial.print("Message arrived on topic: ");
+    Serial.print(topic);
+    Serial.print(". Message: ");
+  }
   String messageTemp;
   
   for (int i = 0; i < length; i++) {
-    Serial.print((char)message[i]);
+    if (debug){
+      Serial.print((char)message[i]);
+    }
     messageTemp += (char)message[i];
   }
-  Serial.println();
+  if (debug){
+    Serial.println();
+  }
 
   // MQTT Actions
 
@@ -235,7 +329,9 @@ void callback(char* topic, byte* message, unsigned int length) {
   if (String(topic) == MQTTledEnable){
     if (messageTemp == "true"){
       if (ledEnable == false){
-        Serial.println("LED disabled");
+        if (debug){
+          Serial.println("LED disabled");
+        }
         ledEnable = true;
       }
     if (messageTemp == "false"){
@@ -250,20 +346,26 @@ void callback(char* topic, byte* message, unsigned int length) {
   // Heartbeat Interval
   if (String(topic) == MQTTheartbeat){
     unsigned long newHeartbeatInterval = strtoul(messageTemp.c_str(),NULL,0);
-    Serial.print("Received new Heartbeat Interval: ");
-    Serial.println(newHeartbeatInterval);
+    if (debug){
+      Serial.print("Received new Heartbeat Interval: ");
+      Serial.println(newHeartbeatInterval);
+    }
     if ((newHeartbeatInterval-MQTTheartbeatMIN)*(newHeartbeatInterval-MQTTheartbeatMAX)){
       heartbeatInterval = newHeartbeatInterval;
-      Serial.print("Heartbeat Interval Set To :");
-      Serial.print(newHeartbeatInterval);
-      Serial.println(" via MQTT");
-      client.publish(heartbeatIntervalPub,messageTemp.c_str());
+      if (debug){
+        Serial.print("Heartbeat Interval Set To :");
+        Serial.print(newHeartbeatInterval);
+        Serial.println(" via MQTT");
+        client.publish(heartbeatIntervalPub,messageTemp.c_str());
+      }
     }
     else{
-      Serial.print("New Heartbeat Interval Must be > ");
-      Serial.println(MQTTheartbeatMIN);
-      Serial.print("Heartbeat Interval Remains: ");
-      Serial.println(heartbeatInterval);
+      if (debug){
+        Serial.print("New Heartbeat Interval Must be > ");
+        Serial.println(MQTTheartbeatMIN);
+        Serial.print("Heartbeat Interval Remains: ");
+        Serial.println(heartbeatInterval);
+      }
     }    
   }
 
@@ -271,20 +373,26 @@ void callback(char* topic, byte* message, unsigned int length) {
   // Motion Lockout Time
   if (String(topic) == MQTTmotionlockout){
     unsigned long newLockoutTime = strtoul(messageTemp.c_str(),NULL,0);
-    Serial.print("Received new lockout: ");
-    Serial.println(newLockoutTime);
+    if (debug){
+      Serial.print("Received new lockout: ");
+      Serial.println(newLockoutTime);
+    }
     if ((newLockoutTime-MQTTmotionlockoutMIN)*(newLockoutTime-MQTTmotionlockoutMAX)){
       motionLockoutTime = newLockoutTime;
-      Serial.print("Motion Lockout Time Set To :");
-      Serial.print(newLockoutTime);
-      Serial.println(" via MQTT");
-      client.publish(lockoutTimePub,messageTemp.c_str());
+      if (debug){
+        Serial.print("Motion Lockout Time Set To :");
+        Serial.print(newLockoutTime);
+        Serial.println(" via MQTT");
+        client.publish(lockoutTimePub,messageTemp.c_str());
+      }
     }
     else{
-      Serial.print("New Lockout Time Must be > ");
-      Serial.println(MQTTmotionlockoutMIN);
-      Serial.print("Lockout Time Remains: ");
-      Serial.println(motionLockoutTime);
+      if (debug){
+        Serial.print("New Lockout Time Must be > ");
+        Serial.println(MQTTmotionlockoutMIN);
+        Serial.print("Lockout Time Remains: ");
+        Serial.println(motionLockoutTime);
+      }
     }    
   }
 
@@ -293,26 +401,22 @@ void callback(char* topic, byte* message, unsigned int length) {
     if (messageTemp == "enable"){
       if (motionEnabled == false){
         motionEnabled = true;
-        Serial.println("Motion Sensor Enabled");
-        client.publish(MQTTmotionenable, "Enabled");
+        if (debug){
+          Serial.println("Motion Sensor Enabled");
+          client.publish(MQTTmotionenable, "Enabled");
+        }
       }
     }
     if (messageTemp == "disable"){
       if (motionEnabled == true){
         motionEnabled = false;
-        Serial.println("MotionSensor Disabled");
-        client.publish(MQTTmotionenable, "Disabled");
+        if (debug){
+          Serial.println("MotionSensor Disabled");
+          client.publish(MQTTmotionenable, "Disabled");
+        }
       }
     }
   }
-  // Status Message with JSON payload
-  if (String(topic) == MQTTstatus){
-    if (messageTemp == "get"){
-      publishState();
-    }
-  }
-  
-  
 }
 
 void reconnect() {
@@ -320,10 +424,14 @@ void reconnect() {
   while (!client.connected()) {
     Serial.print("Attempting MQTT connection...");
     // Attempt to connect
-    if (client.connect("ESP8266Client")) {
-      Serial.println("connected");
+    if (client.connect(uniqueID)) {
+      client.setBufferSize(1024);
+      Serial.print ("connected as");
+      Serial.println(uniqueID);
       // Subscribe
       client.subscribe(subtopic);
+      Serial.print("Subscribed to ");
+      Serial.println(subtopic);
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -357,6 +465,42 @@ void detect_motion(){
     }
 }
 
+int readDHT(){
+  if (debug){
+    Serial.println();
+    Serial.print(millis());
+    Serial.println(": Reading DHT11");
+  }
+  dhtH = dht.readHumidity();
+  dhtT = dht.readTemperature();
+  dhtF = dht.readTemperature(true);
+  if (isnan(dhtH) || isnan(dhtT) || isnan(dhtF)){
+    Serial.print("ERROR: failed to read DHT11 on Pin #");
+    Serial.println(DHT_PIN);
+  }
+  else{
+    dhtLastRead = millis();
+    dhtHIF = dht.computeHeatIndex(dhtF,dhtH);
+    dhtHIC = dht.computeHeatIndex(dhtT,dhtH);
+    if (debug){
+      Serial.println("DHT Sensor Readings:");
+      Serial.print("Humidity: ");
+      Serial.print(dhtH);
+      Serial.println("%RH");
+      Serial.print("Temp: ");
+      Serial.print(dhtF);
+      Serial.print("°F ");
+      Serial.print(dhtT);
+      Serial.println("°C");
+      Serial.print("Heat Index: ");
+      Serial.print(dhtHIF);
+      Serial.print("°F ");
+      Serial.print(dhtHIC);
+      Serial.print("°C");
+    }
+    return 0;
+  }
+}
 
 
 void loop() {
@@ -372,27 +516,39 @@ void loop() {
   if (!initialHeartbeat){
     // This allows us to do initial setup of the sensor upon the first heartbeat...
     // Publish Home Assistant MQTT Config
-    publishHAConfig();
   }
   else{
     // Send First Heartbeat
     unsigned long timeoutHeartbeat = lastHeartbeat + heartbeatInterval;
+
     if (currentTime > timeoutHeartbeat){
-      Serial.print("Heartbeat: ");
-      Serial.println(currentTime);
+      if (debug){
+        Serial.print("Heartbeat: ");
+        Serial.println(currentTime);
+      }
       publishState();
       lastHeartbeat = millis();
     }
   }
   if (!initialHeartbeat){
-    Serial.print("Heartbeat: ");
-    Serial.println(currentTime);
+    if (debug){
+      Serial.print("Heartbeat: ");
+      Serial.println(currentTime);
+    }
+    
+    // Publish Home Assistant Configs
+    publishHATempConfig();
+    publishHARHConfig();
+    publishHAMotionConfig();
+
+    // Publish Initial State
     publishState();
+    
+    
     lastHeartbeat = millis();
     initialHeartbeat = true;
   }
   // END HEARTBEAT
-  
   
   // BEGIN MOTION DETECTION
   if (motionEnabled){
@@ -401,8 +557,6 @@ void loop() {
       if (currentTime > timeout){
         detect_motion();
         if (!detection){
-          Serial.print("Publishing to ");
-          Serial.println(haStateTopic);
           publishState();
           digitalWrite(LEDPIN, LOW);            // Turn off LED
           motionEvent = false;
@@ -412,8 +566,6 @@ void loop() {
     else{
       detect_motion();
       if (detection){
-        Serial.print("Publishing to ");
-        Serial.println(haStateTopic);
         publishState();
         digitalWrite(LEDPIN, HIGH);               // Turn on LED
         detectionStartTime = millis();
@@ -422,4 +574,13 @@ void loop() {
     }
   }
   // END MOTION DETECTION
+
+  // BEGIN DHT
+  if (tempEnabled || humidityEnabled){
+    unsigned long dhtTimeout = dhtLastRead + dhtWait;
+    if (currentTime >= dhtTimeout || dhtLastRead == 0){
+      readDHT();
+    }
+  }
+  // END DHT
 }
